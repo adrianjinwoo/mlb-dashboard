@@ -83,6 +83,40 @@ dashboard_placeholder = st.empty()
 # ==========================================
 # 3. 데이터 파싱 및 AI 알고리즘 함수
 # ==========================================
+# [NEW 1] 최근 7일 타격감 (Hot/Cold) 조회
+@st.cache_data(ttl=3600)
+def get_last_7_days_ops(batter_id):
+    today = datetime.now()
+    d_start = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    d_end = today.strftime("%Y-%m-%d")
+    url = f"https://statsapi.mlb.com/api/v1/people/{batter_id}/stats?stats=byDateRange&group=hitting&startDate={d_start}&endDate={d_end}"
+    try:
+        res = requests.get(url, timeout=3).json()
+        stat = res.get("stats", [{}])[0].get("splits", [{}])[0].get("stat", {})
+        ops = stat.get("ops")
+        if ops: return float(ops)
+    except: pass
+    return None
+
+# [NEW 2] 실시간 투구 구속 저하 추적
+def get_pitcher_velocity_trend(all_plays, current_pitcher_id):
+    fastball_codes = ['FF', 'SI', 'FC'] # 포심, 싱커, 커터
+    speeds = []
+    for play in all_plays:
+        if play.get("matchup", {}).get("pitcher", {}).get("id") == current_pitcher_id:
+            for event in play.get("playEvents", []):
+                if event.get("isPitch"):
+                    details = event.get("details", {})
+                    if details.get("type", {}).get("code") in fastball_codes:
+                        speed = event.get("pitchData", {}).get("startSpeed")
+                        if speed: speeds.append(speed)
+                        
+    if len(speeds) < 20: return None, 0.0
+    baseline = sum(speeds[:15]) / 15
+    recent = sum(speeds[-5:]) / 5
+    drop = baseline - recent
+    return baseline, drop
+
 @st.cache_data(ttl=1800)
 def get_pitcher_preview(pitcher_id, opp_team_id):
     if not pitcher_id: return None
@@ -90,50 +124,33 @@ def get_pitcher_preview(pitcher_id, opp_team_id):
     try:
         res = requests.get(url, timeout=4).json()
         season_str, vs_team_str = "기록 없음", "맞대결 전적 없음"
-        recent_list = []
-        era_val = None
-        
+        recent_list, era_val = [], None
         for st_group in res.get("stats", []):
             s_type = st_group.get("type", {}).get("displayName")
             splits = st_group.get("splits", [])
             if not splits: continue
-            
             if s_type == "season":
                 stat = splits[0].get("stat", {})
                 era = stat.get("era", "-")
                 w, l = stat.get("wins", 0), stat.get("losses", 0)
                 season_str = f"ERA {era} ({w}승 {l}패)"
                 if era not in ["-", "*.**"]: era_val = era
-            
             elif s_type == "gameLog":
                 for g in reversed(splits[-5:]):
-                    dt = g.get("date", "")[5:]
-                    opp = g.get("opponent", {}).get("name", "Opp").split(" ")[-1]
-                    ip = g.get("stat", {}).get("inningsPitched", "0")
-                    er = g.get("stat", {}).get("earnedRuns", "0")
+                    dt, opp = g.get("date", "")[5:], g.get("opponent", {}).get("name", "Opp").split(" ")[-1]
+                    ip, er = g.get("stat", {}).get("inningsPitched", "0"), g.get("stat", {}).get("earnedRuns", "0")
                     recent_list.append(f"{dt} vs {opp}: {ip}이닝 {er}실점")
-                    
             elif s_type == "vsTeam":
                 stat = splits[0].get("stat", {})
-                era = stat.get("era", "-")
-                ip = stat.get("inningsPitched", "0")
-                er = stat.get("earnedRuns", "0")
+                era, ip, er = stat.get("era", "-"), stat.get("inningsPitched", "0"), stat.get("earnedRuns", "0")
                 vs_team_str = f"ERA {era} ({ip}이닝 {er}실점)"
-                
-        return {
-            "season": season_str,
-            "recent": recent_list,
-            "vs_team": vs_team_str,
-            "era_val": era_val
-        }
-    except Exception:
-        return None
+        return {"season": season_str, "recent": recent_list, "vs_team": vs_team_str, "era_val": era_val}
+    except: return None
 
 @st.cache_data(ttl=3600)
 def check_bullpen_fatigue(team_id):
     today = datetime.now()
-    d1 = (today - timedelta(days=2)).strftime("%Y-%m-%d")
-    d2 = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    d1, d2 = (today - timedelta(days=2)).strftime("%Y-%m-%d"), (today - timedelta(days=1)).strftime("%Y-%m-%d")
     url = f"https://statsapi.mlb.com/api/v1/schedule?teamId={team_id}&sportId=1&startDate={d1}&endDate={d2}"
     try:
         res = requests.get(url, timeout=5).json()
@@ -166,8 +183,7 @@ def get_starting_lineup(boxscore, team_key):
 @st.cache_data(ttl=3600)
 def get_previous_lineup(team_id):
     today = datetime.now()
-    d1 = (today - timedelta(days=5)).strftime("%Y-%m-%d")
-    d2 = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    d1, d2 = (today - timedelta(days=5)).strftime("%Y-%m-%d"), (today - timedelta(days=1)).strftime("%Y-%m-%d")
     url = f"https://statsapi.mlb.com/api/v1/schedule?teamId={team_id}&sportId=1&startDate={d1}&endDate={d2}"
     try:
         res = requests.get(url, timeout=5).json()
@@ -188,53 +204,34 @@ def calculate_win_probability(away_diff, home_diff, away_fatigue, home_fatigue, 
     
     if aw_era and hw_era:
         try:
-            era_diff = float(aw_era) - float(hw_era)
-            home_win_prob += (era_diff * 4.0)
-        except ValueError:
-            pass
+            home_win_prob += ((float(aw_era) - float(hw_era)) * 4.0)
+        except ValueError: pass
     
     home_win_prob = max(30.0, min(70.0, home_win_prob))
     away_win_prob = 100.0 - home_win_prob
     
-    home_fair_odds = 1 / (home_win_prob / 100)
-    away_fair_odds = 1 / (away_win_prob / 100)
-    bookmaker_margin = 1.045
-    home_market_odds = 1 / ((home_win_prob / 100) * bookmaker_margin)
-    away_market_odds = 1 / ((away_win_prob / 100) * bookmaker_margin)
+    return away_win_prob, home_win_prob, 1/(away_win_prob/100), 1/(home_win_prob/100), 1/((away_win_prob/100)*1.045), 1/((home_win_prob/100)*1.045)
 
-    return away_win_prob, home_win_prob, away_fair_odds, home_fair_odds, away_market_odds, home_market_odds
-
-# ★ 타자 5명 추출 로직 업데이트 (교체선수 및 타순 순환 완벽 지원)
 def get_batters(boxscore, team_key, offense_info, is_batting_now):
     players = boxscore.get("teams", {}).get(team_key, {}).get("players", {})
-    
-    # 1. 현재 뛰고 있는 1~9번 활성 타순 추출 (대타 교체시 최신 선수 기준)
     active_lineup_dict = {}
     for pid, p_info in players.items():
         bo = p_info.get("battingOrder")
         if bo and len(bo) == 3:
-            order_idx = int(bo[0])
-            sub_idx = int(bo[1:])
-            # 해당 타순에 아직 선수가 없거나, 교체 선수(sub_idx가 더 큼)인 경우 업데이트
-            if order_idx not in active_lineup_dict or sub_idx > active_lineup_dict[order_idx][0]:
-                active_lineup_dict[order_idx] = (sub_idx, p_info)
+            o_idx, s_idx = int(bo[0]), int(bo[1:])
+            if o_idx not in active_lineup_dict or s_idx > active_lineup_dict[o_idx][0]:
+                active_lineup_dict[o_idx] = (s_idx, p_info)
                 
-    # 1번부터 9번까지 리스트로 정렬
     lineup_ordered = [active_lineup_dict[i][1] for i in range(1, 10) if i in active_lineup_dict]
     if not lineup_ordered: return []
 
-    target_batters = []
     start_idx = 0
-    
-    # 공격 중인 팀이면 현재 타자를 시작점으로 설정
     if is_batting_now:
-        cur_batter_id = offense_info.get("batter", {}).get("id")
+        cur_id = offense_info.get("batter", {}).get("id")
         for i, p in enumerate(lineup_ordered):
-            if p.get("person", {}).get("id") == cur_batter_id:
-                start_idx = i
-                break
+            if p.get("person", {}).get("id") == cur_id: start_idx = i; break
 
-    # 현재 타순부터 '5명' 추출 (타순이 한 바퀴 돌 경우를 위해 모듈러 연산 활용)
+    target_batters = []
     for i in range(5):
         idx = (start_idx + i) % len(lineup_ordered)
         p = lineup_ordered[idx]
@@ -243,30 +240,24 @@ def get_batters(boxscore, team_key, offense_info, is_batting_now):
             "name": p.get("person", {}).get("fullName"),
             "order": int(p.get("battingOrder", "000")[0])
         })
-        
     return target_batters
 
 def fetch_bvp_and_split(batter_id, pitcher_id, pitcher_hand):
     cache_key = f"{batter_id}_{pitcher_id}_{pitcher_hand}"
     if cache_key in st.session_state.stats_cache: return st.session_state.stats_cache[cache_key]
-    hand_key = "vs Left" if pitcher_hand == "L" else "vs Right"
-    res_data = {"bvp_text": "전적 없음", "bvp_ops": None, "split_ops": 0.700}
+    hand_key, res_data = "vs Left" if pitcher_hand == "L" else "vs Right", {"bvp_text": "전적 없음", "bvp_ops": None, "split_ops": 0.700}
     try:
-        b_url = f"https://statsapi.mlb.com/api/v1/people/{batter_id}/stats?stats=vsPlayer&opposingPlayerId={pitcher_id}&group=hitting"
-        b_res = requests.get(b_url, timeout=3).json()
+        b_res = requests.get(f"https://statsapi.mlb.com/api/v1/people/{batter_id}/stats?stats=vsPlayer&opposingPlayerId={pitcher_id}&group=hitting", timeout=3).json()
         b_splits = b_res.get("stats", [{}])[0].get("splits", [])
         if b_splits:
             stat = b_splits[0].get("stat", {})
             ops = float(stat.get("ops", ".000"))
-            res_data["bvp_text"] = f"{stat.get('atBats', 0)}수 {stat.get('hits', 0)}안 {stat.get('homeRuns', 0)}홈 (OPS {ops:.3f})"
+            res_data["bvp_text"] = f"{stat.get('atBats', 0)}수 {stat.get('hits', 0)}안 (OPS {ops:.3f})"
             res_data["bvp_ops"] = ops
-        s_url = f"https://statsapi.mlb.com/api/v1/people/{batter_id}/stats?stats=statSplits&group=hitting&sitCodes=vl,vr"
-        s_res = requests.get(s_url, timeout=3).json()
+        s_res = requests.get(f"https://statsapi.mlb.com/api/v1/people/{batter_id}/stats?stats=statSplits&group=hitting&sitCodes=vl,vr", timeout=3).json()
         s_splits = s_res.get("stats", [{}])[0].get("splits", [])
         for s in s_splits:
-            if s.get("split", {}).get("description") == hand_key:
-                res_data["split_ops"] = float(s.get("stat", {}).get("ops", 0.700))
-                break
+            if s.get("split", {}).get("description") == hand_key: res_data["split_ops"] = float(s.get("stat", {}).get("ops", 0.700)); break
     except: pass
     st.session_state.stats_cache[cache_key] = res_data
     return res_data
@@ -277,13 +268,22 @@ def evaluate_team_matchup(batters, pitcher_id, pitcher_hand):
     details = []
     for b in batters:
         d = fetch_bvp_and_split(b["id"], pitcher_id, pitcher_hand)
+        l7_ops = get_last_7_days_ops(b["id"]) # [NEW] 최근 7일 스탯 결합
+        
         sp_ops, bvp_ops = d["split_ops"], d["bvp_ops"]
         if sp_ops >= 0.800: score += 1
         elif sp_ops <= 0.650: score -= 1
         if bvp_ops is not None:
             if bvp_ops >= 0.900: score += 1.5
             elif bvp_ops <= 0.500: score -= 1.5
-        details.append(f"**{b['order']}번 {b['name']}**: {pitcher_hand}투 OPS `{sp_ops:.3f}` | {d['bvp_text']}")
+            
+        hot_cold_str = ""
+        if l7_ops:
+            if l7_ops >= 0.900: score += 1; hot_cold_str = f" | 🔥7일 OPS `{l7_ops:.3f}`"
+            elif l7_ops <= 0.550: score -= 1; hot_cold_str = f" | ❄️7일 OPS `{l7_ops:.3f}`"
+            else: hot_cold_str = f" | 📊7일 OPS `{l7_ops:.3f}`"
+            
+        details.append(f"**{b['order']}번 {b['name']}**: {pitcher_hand}투 OPS `{sp_ops:.3f}`{hot_cold_str} | {d['bvp_text']}")
     return score, details
 
 def extract_runners(offense, boxscore, is_top):
@@ -293,49 +293,53 @@ def extract_runners(offense, boxscore, is_top):
         base_obj = offense.get(base_key)
         if not base_obj: return None
         if "fullName" in base_obj: return base_obj["fullName"]
-        pid = base_obj.get("id")
-        return players.get(f"ID{pid}", {}).get("person", {}).get("fullName", f"Runner({pid})")
+        return players.get(f"ID{base_obj.get('id')}", {}).get("person", {}).get("fullName", f"Runner")
     r1, r2, r3 = get_name("first"), get_name("second"), get_name("third")
-    icon = f"[{'🔴' if r3 else '⚪'}{'🔴' if r2 else '⚪'}{'🔴' if r1 else '⚪'}]"
-    names = []
-    if r3: names.append(f"3루: {r3}")
-    if r2: names.append(f"2루: {r2}")
-    if r1: names.append(f"1루: {r1}")
-    return {"icon": icon, "text": " | ".join(names) if names else "주자 없음"}
+    names = [f"{b}루: {r}" for b, r in zip([3,2,1], [r3,r2,r1]) if r]
+    return {"icon": f"[{'🔴' if r3 else '⚪'}{'🔴' if r2 else '⚪'}{'🔴' if r1 else '⚪'}]", "text": " | ".join(names) if names else "주자 없음"}
 
-def get_live_total_recommendation(current_inning, total_runs, total_fatigued):
-    if current_inning <= 4:
-        return "<p style='color:gray;'>⏳ 5회 이전은 변동성이 커서 잔여 토탈 가이드를 제공하지 않습니다.</p>"
+# [NEW 3] 구장(Park Factor) 및 날씨(Weather)를 반영한 실시간 토탈 계산
+def get_live_total_recommendation(current_inning, total_runs, total_fatigued, temp, wind, venue):
+    if current_inning <= 4: return "<p style='color:gray;'>⏳ 5회 이전은 변동성이 커서 잔여 토탈 가이드를 제공하지 않습니다.</p>"
 
-    line1 = total_runs + 1.5
-    line2 = total_runs + 2.5
-    l1_over, l1_under = 1.85, 2.05
-    l2_over, l2_under = 2.40, 1.60
+    l1_over, l1_under = (2.30, 1.50) if current_inning >= 8 else (1.85, 2.05)
+    l2_over, l2_under = (3.50, 1.25) if current_inning >= 8 else (2.40, 1.60)
 
-    if current_inning >= 8:
-        l1_over, l1_under = 2.30, 1.50
-        l2_over, l2_under = 3.50, 1.25
-
+    # 불펜 피로도 보정
     if total_fatigued >= 3:
         l1_over -= 0.15; l1_under += 0.25; l2_over -= 0.30; l2_under += 0.15
     elif total_fatigued == 0 and current_inning >= 6:
         l1_over += 0.25; l1_under -= 0.15; l2_over += 0.35; l2_under -= 0.10
 
-    pass_msg = "<span style='color:gray; font-size:0.85em;'>(리스크 높아 패스 권장)</span>"
+    # 파크 팩터 및 날씨 보정 (오버 친화적일수록 Over 배당컷 낮춤)
+    weather_desc = ""
+    try:
+        temp_val = int(temp)
+        if temp_val >= 80: l1_over -= 0.05; l2_over -= 0.05; weather_desc += "🌡️폭염(타자 유리) "
+        elif temp_val <= 55: l1_over += 0.05; l2_over += 0.05; weather_desc += "🥶추위(투수 유리) "
+    except: pass
     
+    if "Out" in wind: l1_over -= 0.10; l2_over -= 0.10; weather_desc += "🌬️외야 강풍(오버 주의) "
+    elif "In" in wind: l1_over += 0.10; l2_over += 0.10; weather_desc += "🌬️역풍(언더 유리) "
+        
+    hitter_parks = ["Coors Field", "Great American Ball Park", "Fenway Park"]
+    pitcher_parks = ["T-Mobile Park", "Oakland Coliseum", "Petco Park"]
+    if venue in hitter_parks: l1_over -= 0.15; l2_over -= 0.15
+    elif venue in pitcher_parks: l1_over += 0.15; l2_over += 0.15
+
     return f"""<div style="background-color: rgba(255, 255, 255, 0.05); padding: 15px; border-radius: 8px; margin-top: 15px; border: 1px solid rgba(255,255,255,0.1);">
 <h4 style="margin-top:0; color:#4fc3f7;">💡 실시간 라이브 토탈 (현재 합산 {total_runs}점)</h4>
-<p style="margin-bottom: 5px; font-size:1.1em;">▶ <b>[{line1} 기준점]</b> <span style="font-size:0.9em; color:gray;">(잔여 1.5점 기준)</span></p>
+<p style="color:#b0bec5; font-size:0.9em; margin-bottom:10px;">{weather_desc}</p>
+<p style="margin-bottom: 5px; font-size:1.1em;">▶ <b>[{total_runs + 1.5} 기준점]</b></p>
 <ul style="margin-bottom: 15px;">
-    <li><b>언더 (잔여 0~1점):</b> <code style="color:#00d26a; font-size:1.1em;">{l1_under:.2f} 이상</code> 추천 {pass_msg if l1_under < 1.45 else ""}</li>
-    <li><b>오버 (잔여 2점 이상):</b> <code style="color:#ff4b4b; font-size:1.1em;">{l1_over:.2f} 이상</code> 추천</li>
+    <li><b>언더:</b> <code style="color:#00d26a;">{l1_under:.2f} 이상</code> 추천</li>
+    <li><b>오버:</b> <code style="color:#ff4b4b;">{l1_over:.2f} 이상</code> 추천</li>
 </ul>
-<p style="margin-bottom: 5px; font-size:1.1em;">▶ <b>[{line2} 기준점]</b> <span style="font-size:0.9em; color:gray;">(잔여 2.5점 기준)</span></p>
+<p style="margin-bottom: 5px; font-size:1.1em;">▶ <b>[{total_runs + 2.5} 기준점]</b></p>
 <ul style="margin-bottom: 0;">
-    <li><b>언더 (잔여 0~2점):</b> <code style="color:#00d26a; font-size:1.1em;">{l2_under:.2f} 이상</code> 추천 {pass_msg if l2_under < 1.45 else ""}</li>
-    <li><b>오버 (잔여 3점 이상):</b> <code style="color:#ff4b4b; font-size:1.1em;">{l2_over:.2f} 이상</code> 추천</li>
-</ul>
-</div>"""
+    <li><b>언더:</b> <code style="color:#00d26a;">{l2_under:.2f} 이상</code> 추천</li>
+    <li><b>오버:</b> <code style="color:#ff4b4b;">{l2_over:.2f} 이상</code> 추천</li>
+</ul></div>"""
 
 # ==========================================
 # 4. 실시간 메인 루프 
@@ -351,6 +355,10 @@ while True:
 
     status_state = game_data.get("status", {}).get("abstractGameState", "")
     detailed_state = game_data.get("status", {}).get("detailedState", "")
+    weather = game_data.get("weather", {})
+    venue_name = game_data.get("venue", {}).get("name", "Unknown Venue")
+    temp = weather.get("temp", "N/A")
+    wind = weather.get("wind", "N/A")
     
     away_id = game_data.get("teams", {}).get("away", {}).get("id")
     home_id = game_data.get("teams", {}).get("home", {}).get("id")
@@ -367,6 +375,9 @@ while True:
 
     with dashboard_placeholder.container():
         
+        # --- 공통 상단 환경 패널 ---
+        st.markdown(f"<div style='text-align:center; color:#b0bec5; font-size:1.1rem; padding:10px;'>🏟️ <b>구장:</b> {venue_name} &nbsp;|&nbsp; 🌡️ <b>날씨:</b> {temp}℉ &nbsp;|&nbsp; 🌬️ <b>바람:</b> {wind}</div>", unsafe_allow_html=True)
+        
         # ----------------------------------------------------
         # 브랜치 A: 시작 전 경기 (Scheduled / Preview)
         # ----------------------------------------------------
@@ -380,81 +391,52 @@ while True:
                 cur_home_lineup = get_starting_lineup(boxscore, "home")
                 prev_away_lineup = get_previous_lineup(away_id)
                 prev_home_lineup = get_previous_lineup(home_id)
-                
                 away_diff = [p for p in prev_away_lineup if p not in cur_away_lineup] if cur_away_lineup else []
                 home_diff = [p for p in prev_home_lineup if p not in cur_home_lineup] if cur_home_lineup else []
                 
-                away_sp_info = game_info.get("away_sp", {})
-                home_sp_info = game_info.get("home_sp", {})
-                
-                if not away_sp_info.get("id"):
-                    prob = game_data.get("probablePitchers", {}).get("away", {})
-                    away_sp_info = {"id": prob.get("id"), "fullName": prob.get("fullName", "미정")}
-                if not home_sp_info.get("id"):
-                    prob = game_data.get("probablePitchers", {}).get("home", {})
-                    home_sp_info = {"id": prob.get("id"), "fullName": prob.get("fullName", "미정")}
+                away_sp_info, home_sp_info = game_info.get("away_sp", {}), game_info.get("home_sp", {})
+                if not away_sp_info.get("id"): away_sp_info = {"id": game_data.get("probablePitchers", {}).get("away", {}).get("id"), "fullName": game_data.get("probablePitchers", {}).get("away", {}).get("fullName", "미정")}
+                if not home_sp_info.get("id"): home_sp_info = {"id": game_data.get("probablePitchers", {}).get("home", {}).get("id"), "fullName": game_data.get("probablePitchers", {}).get("home", {}).get("fullName", "미정")}
 
-                aw_p_data = get_pitcher_preview(away_sp_info.get("id"), home_id)
-                hw_p_data = get_pitcher_preview(home_sp_info.get("id"), away_id)
-                
-                aw_era = aw_p_data["era_val"] if aw_p_data else None
-                hw_era = hw_p_data["era_val"] if hw_p_data else None
-                
+                aw_p_data, hw_p_data = get_pitcher_preview(away_sp_info.get("id"), home_id), get_pitcher_preview(home_sp_info.get("id"), away_id)
                 aw_prob, hw_prob, aw_fair, hw_fair, aw_market, hw_market = calculate_win_probability(
-                    away_diff, home_diff, away_fatigued, home_fatigued, aw_era, hw_era
+                    away_diff, home_diff, away_fatigued, home_fatigued, 
+                    aw_p_data["era_val"] if aw_p_data else None, hw_p_data["era_val"] if hw_p_data else None
                 )
                 
                 st.session_state.lineup_cache.update({
                     "away_lineup": cur_away_lineup, "home_lineup": cur_home_lineup,
                     "away_diff": away_diff, "home_diff": home_diff,
-                    "aw_prob": aw_prob, "hw_prob": hw_prob,
-                    "aw_fair": aw_fair, "hw_fair": hw_fair,
-                    "aw_market": aw_market, "hw_market": hw_market,
-                    "aw_p_name": away_sp_info.get("fullName", "미정"),
-                    "hw_p_name": home_sp_info.get("fullName", "미정"),
-                    "aw_p_data": aw_p_data,
-                    "hw_p_data": hw_p_data
+                    "aw_prob": aw_prob, "hw_prob": hw_prob, "aw_fair": aw_fair, "hw_fair": hw_fair, "aw_market": aw_market, "hw_market": hw_market,
+                    "aw_p_name": away_sp_info.get("fullName", "미정"), "hw_p_name": home_sp_info.get("fullName", "미정"),
+                    "aw_p_data": aw_p_data, "hw_p_data": hw_p_data
                 })
             
             lc = st.session_state.lineup_cache
             st.markdown("### 🔮 프리게임(Pre-game) 승패 예측 & 선발/라인업 변동 분석")
-            
             pred_col1, pred_col2 = st.columns(2)
             with pred_col1:
                 st.info(f"#### 🚀 {away_name} (원정)")
                 st.markdown(f"**AI 승률 예측:** <span style='font-size:1.3rem; color:#00d26a;'>{lc['aw_prob']:.1f}%</span>", unsafe_allow_html=True)
-                st.markdown(f"**실제 시장 배당 (예상):** <span style='font-size:1.1rem; color:#b0bec5;'>{lc['aw_market']:.2f}</span>", unsafe_allow_html=True)
                 st.markdown(f"**적정 진입 배당 (Fair):** <span style='font-size:1.5rem; font-weight:bold; color:#ffeb3b;'>{lc['aw_fair']:.2f} 이상</span>", unsafe_allow_html=True)
                 st.markdown("**선발 타순:** " + (", ".join(lc["away_lineup"][:6]) + " 등" if lc["away_lineup"] else "⚠️ 미발표"))
                 st.markdown(f"🚨 **직전 경기 대비 타자 결장자:** <span style='color:#ff4b4b;'>{', '.join(lc['away_diff']) if lc['away_diff'] else '없음 (풀주전)'}</span>", unsafe_allow_html=True)
-                st.markdown(f"🛑 **3연투 이탈 불펜:** <span style='color:#ff4b4b;'>{', '.join(away_fatigued) if away_fatigued else '없음 (전원 대기)'}</span>", unsafe_allow_html=True)
-
+                st.markdown(f"🛑 **3연투 이탈 불펜:** <span style='color:#ff4b4b;'>{', '.join(away_fatigued) if away_fatigued else '없음'}</span>", unsafe_allow_html=True)
                 st.markdown("<hr style='margin:12px 0;'>", unsafe_allow_html=True)
                 st.markdown(f"⚾ **선발 투수:** <span style='color:#00e5ff; font-size:1.2rem; font-weight:bold;'>{lc['aw_p_name']}</span>", unsafe_allow_html=True)
                 if lc["aw_p_data"]:
-                    st.markdown(f"**📌 올시즌 기록:** `{lc['aw_p_data']['season']}`")
-                    st.markdown(f"**⚔️ 오늘 상대전적:** `{lc['aw_p_data']['vs_team']}`")
-                    with st.expander("📉 최근 5경기 투구 내용", expanded=False):
-                        for r in lc["aw_p_data"]["recent"]:
-                            st.markdown(f"- {r}")
-
+                    st.markdown(f"**📌 올시즌:** `{lc['aw_p_data']['season']}` | **⚔️ 상대전적:** `{lc['aw_p_data']['vs_team']}`")
             with pred_col2:
                 st.warning(f"#### 🏠 {home_name} (홈)")
                 st.markdown(f"**AI 승률 예측:** <span style='font-size:1.3rem; color:#00d26a;'>{lc['hw_prob']:.1f}%</span>", unsafe_allow_html=True)
-                st.markdown(f"**실제 시장 배당 (예상):** <span style='font-size:1.1rem; color:#b0bec5;'>{lc['hw_market']:.2f}</span>", unsafe_allow_html=True)
                 st.markdown(f"**적정 진입 배당 (Fair):** <span style='font-size:1.5rem; font-weight:bold; color:#ffeb3b;'>{lc['hw_fair']:.2f} 이상</span>", unsafe_allow_html=True)
                 st.markdown("**선발 타순:** " + (", ".join(lc["home_lineup"][:6]) + " 등" if lc["home_lineup"] else "⚠️ 미발표"))
                 st.markdown(f"🚨 **직전 경기 대비 타자 결장자:** <span style='color:#ff4b4b;'>{', '.join(lc['home_diff']) if lc['home_diff'] else '없음 (풀주전)'}</span>", unsafe_allow_html=True)
-                st.markdown(f"🛑 **3연투 이탈 불펜:** <span style='color:#ff4b4b;'>{', '.join(home_fatigued) if home_fatigued else '없음 (전원 대기)'}</span>", unsafe_allow_html=True)
-
+                st.markdown(f"🛑 **3연투 이탈 불펜:** <span style='color:#ff4b4b;'>{', '.join(home_fatigued) if home_fatigued else '없음'}</span>", unsafe_allow_html=True)
                 st.markdown("<hr style='margin:12px 0;'>", unsafe_allow_html=True)
                 st.markdown(f"⚾ **선발 투수:** <span style='color:#00e5ff; font-size:1.2rem; font-weight:bold;'>{lc['hw_p_name']}</span>", unsafe_allow_html=True)
                 if lc["hw_p_data"]:
-                    st.markdown(f"**📌 올시즌 기록:** `{lc['hw_p_data']['season']}`")
-                    st.markdown(f"**⚔️ 오늘 상대전적:** `{lc['hw_p_data']['vs_team']}`")
-                    with st.expander("📉 최근 5경기 투구 내용", expanded=False):
-                        for r in lc["hw_p_data"]["recent"]:
-                            st.markdown(f"- {r}")
+                    st.markdown(f"**📌 올시즌:** `{lc['hw_p_data']['season']}` | **⚔️ 상대전적:** `{lc['hw_p_data']['vs_team']}`")
 
         # ----------------------------------------------------
         # 브랜치 B: 진행 중인 경기 (Live)
@@ -464,7 +446,6 @@ while True:
             is_top = linescore.get("isTopInning")
             half_str = "초 (Top)" if is_top else "말 (Bot)"
             current_inning = linescore.get("currentInning", 1)
-
             outs, balls, strikes = linescore.get("outs", 0), linescore.get("balls", 0), linescore.get("strikes", 0)
             offense = linescore.get("offense", {})
             runners = extract_runners(offense, boxscore, is_top)
@@ -472,10 +453,15 @@ while True:
             cur_match = live_data.get("plays", {}).get("currentPlay", {}).get("matchup", {})
             cur_pitcher = cur_match.get("pitcher", {}).get("fullName", "Unknown")
             cur_batter = offense.get("batter", {}).get("fullName", "Unknown")
-            
             p_id = cur_match.get("pitcher", {}).get("id")
             def_key = "home" if is_top else "away"
             pitches = boxscore.get("teams", {}).get(def_key, {}).get("players", {}).get(f"ID{p_id}", {}).get("stats", {}).get("pitching", {}).get("numberOfPitches", 0)
+
+            # [NEW 2 적용] 구속 트래커 실행
+            base_vel, vel_drop = get_pitcher_velocity_trend(live_data.get("plays", {}).get("allPlays", []), p_id)
+            vel_alert_html = ""
+            if base_vel and vel_drop >= 1.5:
+                vel_alert_html = f"<br><span style='color:#ff4b4b; font-weight:bold; font-size:1.1rem;'>🚨 구속 저하 감지! (직구 평균 {base_vel:.1f}mph ➔ 최근 {base_vel-vel_drop:.1f}mph) - 장타 허용 위험 증가</span>"
 
             if is_top and current_inning != st.session_state.prev_inning:
                 st.session_state.prev_inning = current_inning
@@ -484,12 +470,10 @@ while True:
                 h_hand = boxscore.get("teams", {}).get("home", {}).get("players", {}).get(f"ID{home_pid}", {}).get("pitchHand", {}).get("code", "R")
                 a_hand = boxscore.get("teams", {}).get("away", {}).get("players", {}).get(f"ID{away_pid}", {}).get("pitchHand", {}).get("code", "R")
 
-                # ★ 변경: 5명의 타자를 추출하여 상성 비교
                 s_away, det_away = evaluate_team_matchup(get_batters(boxscore, "away", offense, is_top), home_pid, h_hand)
                 s_home, det_home = evaluate_team_matchup(get_batters(boxscore, "home", offense, not is_top), away_pid, a_hand)
                 tot_score = s_away + s_home
 
-                # ★ 변경: 평가 대상이 10명으로 늘어나 기준점(컷오프) 상향 조정
                 if tot_score >= 4.5: sig, odds = "🔥 강력 오버", "2.05 이상"
                 elif tot_score <= -4.5: sig, odds = "🛡️ 강력 언더", "1.85 이상"
                 else: sig, odds = "🔍 관망 (상성 팽팽함)", "진입 패스"
@@ -502,7 +486,7 @@ while True:
 
             st.markdown(f"<h1 style='text-align: center; font-size: 3rem;'>🏟️ {away_name} <span style='color:#00e5ff;'>{away_score} : {home_score}</span> {home_name}</h1>", unsafe_allow_html=True)
             st.markdown(f"<h3 style='text-align: center; color: #ffeb3b;'>{inning_str} {half_str} &nbsp;|&nbsp; {outs} OUT &nbsp;|&nbsp; B-S: {balls}-{strikes} &nbsp;|&nbsp; 베이스: {runners['icon']}</h3>", unsafe_allow_html=True)
-            st.markdown(f"<h5 style='text-align: center; color: #b0bec5; margin-bottom: 25px;'>🏃 <b>현재 주자:</b> {runners['text']} <br><br>⚾ <b>투수:</b> {cur_pitcher} ({pitches}구) &nbsp; vs &nbsp; 🏏 <b>타자:</b> {cur_batter}</h5>", unsafe_allow_html=True)
+            st.markdown(f"<h5 style='text-align: center; color: #b0bec5; margin-bottom: 25px;'>🏃 <b>현재 주자:</b> {runners['text']} <br><br>⚾ <b>투수:</b> {cur_pitcher} ({pitches}구){vel_alert_html} <br><br>🏏 <b>타자:</b> {cur_batter}</h5>", unsafe_allow_html=True)
             st.divider()
 
             col_full_game, col_inning = st.columns(2)
@@ -511,7 +495,10 @@ while True:
                 tf = len(away_fatigued) + len(home_fatigued)
                 fg_sig = "🔥 후반 이닝 오버 유리" if tf >= 3 else ("🛡️ 후반 이닝 언더 유리" if tf == 0 and current_inning >= 6 else "⚖️ 불펜 중립")
                 st.markdown(f"""<div style="font-size: 1.3rem; font-weight: bold; color: #ff4b4b; padding: 10px; border-left: 5px solid #ff4b4b; background-color: rgba(255, 75, 75, 0.1); margin-bottom: 15px;">🏁 전체 흐름 판정: {fg_sig}</div>""", unsafe_allow_html=True)
-                st.markdown(get_live_total_recommendation(current_inning, away_score + home_score, tf), unsafe_allow_html=True)
+                
+                # [NEW 3 적용] 날씨/구장 팩터를 반영한 토탈 계산기
+                st.markdown(get_live_total_recommendation(current_inning, away_score + home_score, tf, temp, wind, venue_name), unsafe_allow_html=True)
+                
                 st.markdown("<br>#### 🚨 오늘 등판 불가 유력 불펜 (3연투 경고)", unsafe_allow_html=True)
                 st.info(f"**{away_name} 불펜:** {', '.join(away_fatigued) if away_fatigued else '없음'}")
                 st.warning(f"**{home_name} 불펜:** {', '.join(home_fatigued) if home_fatigued else '없음'}")
@@ -522,7 +509,7 @@ while True:
                     b = st.session_state.last_briefing
                     st.markdown(f"""<div style="font-size: 1.3rem; font-weight: bold; color: #00d26a; padding: 10px; border-left: 5px solid #00d26a; background-color: rgba(0, 210, 106, 0.1); margin-bottom: 15px;">🎯 추천 포지션: {b['signal']}</div>""", unsafe_allow_html=True)
                     st.markdown(f"**적용 이닝:** `{b['title']}`  |  **권장 배당:** `{b['odds']}`")
-                    with st.expander("🔍 세부 5타자 매치업 전적 (BvP & 스플릿) 보기", expanded=False):
+                    with st.expander("🔍 세부 5타자 매치업 전적 (BvP & 최근 7일 스탯)", expanded=False):
                         st.markdown(f"**[초 공격] 원정 타선(5명) vs 홈 투수**")
                         for d in b["det_away"]: st.markdown(d)
                         st.markdown(f"<br>**[말 공격] 홈 타선(5명) vs 원정 투수**", unsafe_allow_html=True)
