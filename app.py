@@ -73,6 +73,54 @@ dashboard_placeholder = st.empty()
 # ==========================================
 # 3. 데이터 파싱 및 예측 함수 
 # ==========================================
+# [NEW] 선발 투수 스탯 조회 함수 (시즌, 상대 전적, 최근 5경기)
+@st.cache_data(ttl=3600)
+def get_pitcher_preview(pitcher_id, opp_team_id):
+    if not pitcher_id: return None
+    url = f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats?stats=season,gameLog,vsTeam&opposingTeamId={opp_team_id}&group=pitching"
+    try:
+        res = requests.get(url, timeout=5).json()
+        season_str, vs_team_str = "기록 없음", "맞대결 기록 없음"
+        recent_list = []
+        era_val = None
+        
+        for st_group in res.get("stats", []):
+            s_type = st_group.get("type", {}).get("displayName")
+            splits = st_group.get("splits", [])
+            if not splits: continue
+            
+            if s_type == "season":
+                stat = splits[0].get("stat", {})
+                era = stat.get("era", "-")
+                w, l = stat.get("wins", 0), stat.get("losses", 0)
+                season_str = f"ERA {era} ({w}승 {l}패)"
+                if era != "-" and era != "*.**": era_val = era
+            
+            elif s_type == "gameLog":
+                # 최신 5경기 추출
+                for g in reversed(splits[-5:]):
+                    dt = g.get("date", "")[5:]
+                    opp = g.get("opponent", {}).get("name", "U").split(" ")[-1]
+                    ip = g.get("stat", {}).get("inningsPitched", "0")
+                    er = g.get("stat", {}).get("earnedRuns", "0")
+                    recent_list.append(f"{dt} vs {opp}: {ip}이닝 {er}실점")
+                    
+            elif s_type == "vsTeam":
+                stat = splits[0].get("stat", {})
+                era = stat.get("era", "-")
+                ip = stat.get("inningsPitched", "0")
+                er = stat.get("earnedRuns", "0")
+                vs_team_str = f"ERA {era} ({ip}이닝 {er}실점)"
+                
+        return {
+            "season": season_str,
+            "recent": recent_list,
+            "vs_team": vs_team_str,
+            "era_val": era_val
+        }
+    except Exception:
+        return None
+
 @st.cache_data(ttl=3600)
 def check_bullpen_fatigue(team_id):
     today = datetime.now()
@@ -122,19 +170,29 @@ def get_previous_lineup(team_id):
         return get_starting_lineup(box, t_key)
     except: return []
 
-def calculate_win_probability(away_diff, home_diff, away_fatigue, home_fatigue):
+# ★ 배당 계산 로직 업데이트 (선발 투수 ERA 반영)
+def calculate_win_probability(away_diff, home_diff, away_fatigue, home_fatigue, aw_era, hw_era):
     home_win_prob = 53.5
+    # 결장자 감점
     home_win_prob -= (len(home_diff) * 2.5)
     home_win_prob += (len(away_diff) * 2.5)
+    # 불펜 이탈 감점
     home_win_prob -= (len(home_fatigue) * 1.5)
     home_win_prob += (len(away_fatigue) * 1.5)
+    
+    # 선발 투수 ERA 보정 (ERA 1.0 차이당 승률 약 4% 가중치 반영)
+    if aw_era and hw_era:
+        try:
+            era_diff = float(aw_era) - float(hw_era)
+            home_win_prob += (era_diff * 4.0) # 원정 방어율이 낮아 음수가 되면 홈 승률 하락
+        except ValueError:
+            pass
     
     home_win_prob = max(30.0, min(70.0, home_win_prob))
     away_win_prob = 100.0 - home_win_prob
     
     home_fair_odds = 1 / (home_win_prob / 100)
     away_fair_odds = 1 / (away_win_prob / 100)
-
     bookmaker_margin = 1.045
     home_market_odds = 1 / ((home_win_prob / 100) * bookmaker_margin)
     away_market_odds = 1 / ((away_win_prob / 100) * bookmaker_margin)
@@ -299,18 +357,34 @@ while True:
                 
                 away_diff = [p for p in prev_away_lineup if p not in cur_away_lineup] if cur_away_lineup else []
                 home_diff = [p for p in prev_home_lineup if p not in cur_home_lineup] if cur_home_lineup else []
-                aw_prob, hw_prob, aw_fair, hw_fair, aw_market, hw_market = calculate_win_probability(away_diff, home_diff, away_fatigued, home_fatigued)
+                
+                # 선발 투수 조회
+                away_p = game_data.get("probablePitchers", {}).get("away", {})
+                home_p = game_data.get("probablePitchers", {}).get("home", {})
+                aw_p_data = get_pitcher_preview(away_p.get("id"), home_id)
+                hw_p_data = get_pitcher_preview(home_p.get("id"), away_id)
+                
+                aw_era = aw_p_data["era_val"] if aw_p_data else None
+                hw_era = hw_p_data["era_val"] if hw_p_data else None
+                
+                aw_prob, hw_prob, aw_fair, hw_fair, aw_market, hw_market = calculate_win_probability(
+                    away_diff, home_diff, away_fatigued, home_fatigued, aw_era, hw_era
+                )
                 
                 st.session_state.lineup_cache.update({
                     "away_lineup": cur_away_lineup, "home_lineup": cur_home_lineup,
                     "away_diff": away_diff, "home_diff": home_diff,
                     "aw_prob": aw_prob, "hw_prob": hw_prob,
                     "aw_fair": aw_fair, "hw_fair": hw_fair,
-                    "aw_market": aw_market, "hw_market": hw_market
+                    "aw_market": aw_market, "hw_market": hw_market,
+                    "aw_p_name": away_p.get("fullName", "미정"),
+                    "hw_p_name": home_p.get("fullName", "미정"),
+                    "aw_p_data": aw_p_data,
+                    "hw_p_data": hw_p_data
                 })
             
             lc = st.session_state.lineup_cache
-            st.markdown("### 🔮 프리게임(Pre-game) 승패 예측 & 선발 변동 분석")
+            st.markdown("### 🔮 프리게임(Pre-game) 승패 예측 & 선발/라인업 변동 분석")
             
             pred_col1, pred_col2 = st.columns(2)
             with pred_col1:
@@ -318,20 +392,42 @@ while True:
                 st.markdown(f"**AI 승률 예측:** <span style='font-size:1.3rem; color:#00d26a;'>{lc['aw_prob']:.1f}%</span>", unsafe_allow_html=True)
                 st.markdown(f"**실제 시장 배당 (예상):** <span style='font-size:1.1rem; color:#b0bec5;'>{lc['aw_market']:.2f}</span>", unsafe_allow_html=True)
                 st.markdown(f"**적정 진입 배당 (Fair):** <span style='font-size:1.5rem; font-weight:bold; color:#ffeb3b;'>{lc['aw_fair']:.2f} 이상</span>", unsafe_allow_html=True)
-                st.markdown("**선발 명단:** " + (", ".join(lc["away_lineup"][:6]) + " 등" if lc["away_lineup"] else "⚠️ 미발표"))
-                st.markdown(f"🚨 **직전 경기 대비 결장자:** <span style='color:#ff4b4b;'>{', '.join(lc['away_diff']) if lc['away_diff'] else '없음 (풀주전)'}</span>", unsafe_allow_html=True)
-                # ★ 시작 전 경기에도 불펜 3연투 이탈 정보 출력 복구
+                
+                # ★ 타자 라인업 & 불펜 정보
+                st.markdown("**선발 타순:** " + (", ".join(lc["away_lineup"][:6]) + " 등" if lc["away_lineup"] else "⚠️ 미발표"))
+                st.markdown(f"🚨 **직전 경기 대비 타자 결장자:** <span style='color:#ff4b4b;'>{', '.join(lc['away_diff']) if lc['away_diff'] else '없음 (풀주전)'}</span>", unsafe_allow_html=True)
                 st.markdown(f"🛑 **3연투 이탈 불펜:** <span style='color:#ff4b4b;'>{', '.join(away_fatigued) if away_fatigued else '없음 (전원 대기)'}</span>", unsafe_allow_html=True)
+
+                # ★ 추가된 선발 투수 스탯 패널
+                st.markdown("<hr style='margin:12px 0;'>", unsafe_allow_html=True)
+                st.markdown(f"⚾ **선발 투수:** <span style='color:#00e5ff; font-size:1.2rem; font-weight:bold;'>{lc['aw_p_name']}</span>", unsafe_allow_html=True)
+                if lc["aw_p_data"]:
+                    st.markdown(f"**📌 올시즌 기록:** `{lc['aw_p_data']['season']}`")
+                    st.markdown(f"**⚔️ 오늘 상대전적:** `{lc['aw_p_data']['vs_team']}`")
+                    with st.expander("📉 최근 5경기 투구 내용", expanded=False):
+                        for r in lc["aw_p_data"]["recent"]:
+                            st.markdown(f"- {r}")
 
             with pred_col2:
                 st.warning(f"#### 🏠 {home_name} (홈)")
                 st.markdown(f"**AI 승률 예측:** <span style='font-size:1.3rem; color:#00d26a;'>{lc['hw_prob']:.1f}%</span>", unsafe_allow_html=True)
                 st.markdown(f"**실제 시장 배당 (예상):** <span style='font-size:1.1rem; color:#b0bec5;'>{lc['hw_market']:.2f}</span>", unsafe_allow_html=True)
                 st.markdown(f"**적정 진입 배당 (Fair):** <span style='font-size:1.5rem; font-weight:bold; color:#ffeb3b;'>{lc['hw_fair']:.2f} 이상</span>", unsafe_allow_html=True)
-                st.markdown("**선발 명단:** " + (", ".join(lc["home_lineup"][:6]) + " 등" if lc["home_lineup"] else "⚠️ 미발표"))
-                st.markdown(f"🚨 **직전 경기 대비 결장자:** <span style='color:#ff4b4b;'>{', '.join(lc['home_diff']) if lc['home_diff'] else '없음 (풀주전)'}</span>", unsafe_allow_html=True)
-                # ★ 시작 전 경기에도 불펜 3연투 이탈 정보 출력 복구
+                
+                # ★ 타자 라인업 & 불펜 정보
+                st.markdown("**선발 타순:** " + (", ".join(lc["home_lineup"][:6]) + " 등" if lc["home_lineup"] else "⚠️ 미발표"))
+                st.markdown(f"🚨 **직전 경기 대비 타자 결장자:** <span style='color:#ff4b4b;'>{', '.join(lc['home_diff']) if lc['home_diff'] else '없음 (풀주전)'}</span>", unsafe_allow_html=True)
                 st.markdown(f"🛑 **3연투 이탈 불펜:** <span style='color:#ff4b4b;'>{', '.join(home_fatigued) if home_fatigued else '없음 (전원 대기)'}</span>", unsafe_allow_html=True)
+
+                # ★ 추가된 선발 투수 스탯 패널
+                st.markdown("<hr style='margin:12px 0;'>", unsafe_allow_html=True)
+                st.markdown(f"⚾ **선발 투수:** <span style='color:#00e5ff; font-size:1.2rem; font-weight:bold;'>{lc['hw_p_name']}</span>", unsafe_allow_html=True)
+                if lc["hw_p_data"]:
+                    st.markdown(f"**📌 올시즌 기록:** `{lc['hw_p_data']['season']}`")
+                    st.markdown(f"**⚔️ 오늘 상대전적:** `{lc['hw_p_data']['vs_team']}`")
+                    with st.expander("📉 최근 5경기 투구 내용", expanded=False):
+                        for r in lc["hw_p_data"]["recent"]:
+                            st.markdown(f"- {r}")
 
         # ----------------------------------------------------
         # 브랜치 B: 진행 중인 경기 (Live)
@@ -392,11 +488,9 @@ while True:
                 st.markdown(f"""<div style="font-size: 1.3rem; font-weight: bold; color: #ff4b4b; padding: 10px; border-left: 5px solid #ff4b4b; background-color: rgba(255, 75, 75, 0.1); margin-bottom: 15px;">🏁 전체 흐름 판정: {fg_sig}</div>""", unsafe_allow_html=True)
                 st.markdown(get_live_total_recommendation(current_inning, away_score + home_score, tf), unsafe_allow_html=True)
                 
-                # ★ 라이브 경기 패널 하단에 불펜 이탈 정보 출력 복구
                 st.markdown("<br>#### 🚨 오늘 등판 불가 유력 불펜 (3연투 경고)", unsafe_allow_html=True)
                 st.info(f"**{away_name} (원정) 불펜:** {', '.join(away_fatigued) if away_fatigued else '없음 (전원 대기)'}")
                 st.warning(f"**{home_name} (홈) 불펜:** {', '.join(home_fatigued) if home_fatigued else '없음 (전원 대기)'}")
-
 
             with col_inning:
                 st.info(f"### 🎯 1이닝(초+말) 단기 타격 상성")
