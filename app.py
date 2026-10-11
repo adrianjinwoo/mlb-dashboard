@@ -83,7 +83,6 @@ dashboard_placeholder = st.empty()
 # ==========================================
 # 3. 데이터 파싱 및 AI 알고리즘 함수
 # ==========================================
-# [NEW 1] 최근 7일 타격감 (Hot/Cold) 조회
 @st.cache_data(ttl=3600)
 def get_last_7_days_ops(batter_id):
     today = datetime.now()
@@ -98,9 +97,8 @@ def get_last_7_days_ops(batter_id):
     except: pass
     return None
 
-# [NEW 2] 실시간 투구 구속 저하 추적
 def get_pitcher_velocity_trend(all_plays, current_pitcher_id):
-    fastball_codes = ['FF', 'SI', 'FC'] # 포심, 싱커, 커터
+    fastball_codes = ['FF', 'SI', 'FC']
     speeds = []
     for play in all_plays:
         if play.get("matchup", {}).get("pitcher", {}).get("id") == current_pitcher_id:
@@ -268,7 +266,7 @@ def evaluate_team_matchup(batters, pitcher_id, pitcher_hand):
     details = []
     for b in batters:
         d = fetch_bvp_and_split(b["id"], pitcher_id, pitcher_hand)
-        l7_ops = get_last_7_days_ops(b["id"]) # [NEW] 최근 7일 스탯 결합
+        l7_ops = get_last_7_days_ops(b["id"])
         
         sp_ops, bvp_ops = d["split_ops"], d["bvp_ops"]
         if sp_ops >= 0.800: score += 1
@@ -298,20 +296,17 @@ def extract_runners(offense, boxscore, is_top):
     names = [f"{b}루: {r}" for b, r in zip([3,2,1], [r3,r2,r1]) if r]
     return {"icon": f"[{'🔴' if r3 else '⚪'}{'🔴' if r2 else '⚪'}{'🔴' if r1 else '⚪'}]", "text": " | ".join(names) if names else "주자 없음"}
 
-# [NEW 3] 구장(Park Factor) 및 날씨(Weather)를 반영한 실시간 토탈 계산
 def get_live_total_recommendation(current_inning, total_runs, total_fatigued, temp, wind, venue):
     if current_inning <= 4: return "<p style='color:gray;'>⏳ 5회 이전은 변동성이 커서 잔여 토탈 가이드를 제공하지 않습니다.</p>"
 
     l1_over, l1_under = (2.30, 1.50) if current_inning >= 8 else (1.85, 2.05)
     l2_over, l2_under = (3.50, 1.25) if current_inning >= 8 else (2.40, 1.60)
 
-    # 불펜 피로도 보정
     if total_fatigued >= 3:
         l1_over -= 0.15; l1_under += 0.25; l2_over -= 0.30; l2_under += 0.15
     elif total_fatigued == 0 and current_inning >= 6:
         l1_over += 0.25; l1_under -= 0.15; l2_over += 0.35; l2_under -= 0.10
 
-    # 파크 팩터 및 날씨 보정 (오버 친화적일수록 Over 배당컷 낮춤)
     weather_desc = ""
     try:
         temp_val = int(temp)
@@ -374,8 +369,6 @@ while True:
     home_fatigued = st.session_state.bullpen_cache.get(f"{home_id}_fatigue", [])
 
     with dashboard_placeholder.container():
-        
-        # --- 공통 상단 환경 패널 ---
         st.markdown(f"<div style='text-align:center; color:#b0bec5; font-size:1.1rem; padding:10px;'>🏟️ <b>구장:</b> {venue_name} &nbsp;|&nbsp; 🌡️ <b>날씨:</b> {temp}℉ &nbsp;|&nbsp; 🌬️ <b>바람:</b> {wind}</div>", unsafe_allow_html=True)
         
         # ----------------------------------------------------
@@ -422,10 +415,16 @@ while True:
                 st.markdown("**선발 타순:** " + (", ".join(lc["away_lineup"][:6]) + " 등" if lc["away_lineup"] else "⚠️ 미발표"))
                 st.markdown(f"🚨 **직전 경기 대비 타자 결장자:** <span style='color:#ff4b4b;'>{', '.join(lc['away_diff']) if lc['away_diff'] else '없음 (풀주전)'}</span>", unsafe_allow_html=True)
                 st.markdown(f"🛑 **3연투 이탈 불펜:** <span style='color:#ff4b4b;'>{', '.join(away_fatigued) if away_fatigued else '없음'}</span>", unsafe_allow_html=True)
+                
+                # ★ 복구된 원정 선발 최근 5경기
                 st.markdown("<hr style='margin:12px 0;'>", unsafe_allow_html=True)
                 st.markdown(f"⚾ **선발 투수:** <span style='color:#00e5ff; font-size:1.2rem; font-weight:bold;'>{lc['aw_p_name']}</span>", unsafe_allow_html=True)
                 if lc["aw_p_data"]:
                     st.markdown(f"**📌 올시즌:** `{lc['aw_p_data']['season']}` | **⚔️ 상대전적:** `{lc['aw_p_data']['vs_team']}`")
+                    with st.expander("📉 최근 5경기 투구 내용", expanded=False):
+                        for r in lc["aw_p_data"]["recent"]:
+                            st.markdown(f"- {r}")
+
             with pred_col2:
                 st.warning(f"#### 🏠 {home_name} (홈)")
                 st.markdown(f"**AI 승률 예측:** <span style='font-size:1.3rem; color:#00d26a;'>{lc['hw_prob']:.1f}%</span>", unsafe_allow_html=True)
@@ -433,10 +432,15 @@ while True:
                 st.markdown("**선발 타순:** " + (", ".join(lc["home_lineup"][:6]) + " 등" if lc["home_lineup"] else "⚠️ 미발표"))
                 st.markdown(f"🚨 **직전 경기 대비 타자 결장자:** <span style='color:#ff4b4b;'>{', '.join(lc['home_diff']) if lc['home_diff'] else '없음 (풀주전)'}</span>", unsafe_allow_html=True)
                 st.markdown(f"🛑 **3연투 이탈 불펜:** <span style='color:#ff4b4b;'>{', '.join(home_fatigued) if home_fatigued else '없음'}</span>", unsafe_allow_html=True)
+                
+                # ★ 복구된 홈 선발 최근 5경기
                 st.markdown("<hr style='margin:12px 0;'>", unsafe_allow_html=True)
                 st.markdown(f"⚾ **선발 투수:** <span style='color:#00e5ff; font-size:1.2rem; font-weight:bold;'>{lc['hw_p_name']}</span>", unsafe_allow_html=True)
                 if lc["hw_p_data"]:
                     st.markdown(f"**📌 올시즌:** `{lc['hw_p_data']['season']}` | **⚔️ 상대전적:** `{lc['hw_p_data']['vs_team']}`")
+                    with st.expander("📉 최근 5경기 투구 내용", expanded=False):
+                        for r in lc["hw_p_data"]["recent"]:
+                            st.markdown(f"- {r}")
 
         # ----------------------------------------------------
         # 브랜치 B: 진행 중인 경기 (Live)
@@ -457,7 +461,6 @@ while True:
             def_key = "home" if is_top else "away"
             pitches = boxscore.get("teams", {}).get(def_key, {}).get("players", {}).get(f"ID{p_id}", {}).get("stats", {}).get("pitching", {}).get("numberOfPitches", 0)
 
-            # [NEW 2 적용] 구속 트래커 실행
             base_vel, vel_drop = get_pitcher_velocity_trend(live_data.get("plays", {}).get("allPlays", []), p_id)
             vel_alert_html = ""
             if base_vel and vel_drop >= 1.5:
@@ -496,7 +499,6 @@ while True:
                 fg_sig = "🔥 후반 이닝 오버 유리" if tf >= 3 else ("🛡️ 후반 이닝 언더 유리" if tf == 0 and current_inning >= 6 else "⚖️ 불펜 중립")
                 st.markdown(f"""<div style="font-size: 1.3rem; font-weight: bold; color: #ff4b4b; padding: 10px; border-left: 5px solid #ff4b4b; background-color: rgba(255, 75, 75, 0.1); margin-bottom: 15px;">🏁 전체 흐름 판정: {fg_sig}</div>""", unsafe_allow_html=True)
                 
-                # [NEW 3 적용] 날씨/구장 팩터를 반영한 토탈 계산기
                 st.markdown(get_live_total_recommendation(current_inning, away_score + home_score, tf, temp, wind, venue_name), unsafe_allow_html=True)
                 
                 st.markdown("<br>#### 🚨 오늘 등판 불가 유력 불펜 (3연투 경고)", unsafe_allow_html=True)
